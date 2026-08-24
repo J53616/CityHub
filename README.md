@@ -1,35 +1,86 @@
 <div align="center">
   <h1>CityHub - 本地生活服务平台</h1>
-<p>
+  <p>类"大众点评"本地生活服务平台 · 面向高并发秒杀场景的缓存与消息队列深度优化实践</p>
+  <p>
     <img src="https://img.shields.io/badge/Spring%20Boot-3.2-green" alt="Spring Boot">
-    <img src="https://img.shields.io/badge/RocketMQ-5.1-blue" alt="RocketMQ">
-    <img src="https://img.shields.io/badge/Redis-7-green" alt="Redis">
-    <img src="https://img.shields.io/badge/MyBatis--Plus-3.5-red" alt="MyBatis-Plus">
-    <img src="https://img.shields.io/badge/Redisson-3.13-orange" alt="Redisson">
+    <img src="https://img.shields.io/badge/MySQL-8-blue" alt="MySQL">
+    <img src="https://img.shields.io/badge/Redis-7-red" alt="Redis">
+    <img src="https://img.shields.io/badge/MyBatis--Plus-3.5-orange" alt="MyBatis-Plus">
+    <img src="https://img.shields.io/badge/RocketMQ-5.1-brightgreen" alt="RocketMQ">
+    <img src="https://img.shields.io/badge/Redisson-3.13-purple" alt="Redisson">
     <img src="https://img.shields.io/badge/License-MIT-yellow" alt="License">
   </p>
 </div>
-
-<br/>
-
-**CityHub** 是一个类"大众点评"的本地生活服务平台。本仓库的重心不在业务功能本身，而在于**高并发秒杀场景下，如何把单体系统从"能用"优化到"抗压"**——记录了我在解决"缓存一致性、秒杀超卖、分布式锁选型、异步削峰"等问题时的设计取舍与复盘。
-
-> 技术栈：**Spring Boot 3.2 + MyBatis-Plus + Redis + Redisson + RocketMQ + MySQL**
 
 ---
 
 ## 目录
 
+- [项目简介](#项目简介)
+- [技术栈](#技术栈)
+- [功能特性](#功能特性)
 - [快速开始](#快速开始)
-- [秒杀核心流程（本项目最难点）](#秒杀核心流程本项目最难点)
-- [缓存：穿透 / 击穿 / 雪崩](#缓存穿透--击穿--雪崩)
-- [异步下单：Redis + Lua + RocketMQ](#异步下单redis--lua--rocketmq)
-- [消息可靠性：幂等、丢失、最终一致](#消息可靠性幂等丢失最终一致)
-- [订单超时关闭与并发控制](#订单超时关闭与并发控制)
-- [分布式锁选型](#分布式锁选型)
-- [全局唯一 ID 生成](#全局唯一-id-生成)
-- [其他 Redis 特性应用](#其他-redis-特性应用)
+- [项目结构](#项目结构)
+- [核心设计](#核心设计)
+- [性能与稳定性](#性能与稳定性)
 - [实现状态清单](#实现状态清单)
+- [后续计划](#后续计划)
+- [License](#license)
+
+---
+
+## 项目简介
+
+CityHub 是一个类"大众点评"的本地生活服务平台，提供商家信息查询、优惠券秒杀、推广信息、用户互动（点赞 / 关注 / 签到 / 附近商户）等能力。
+
+项目的重点不在于业务功能本身，而在于 **高并发秒杀场景下，如何把单体系统从"能用"优化到"抗压"**。围绕秒杀链路的性能瓶颈，基于 **缓存架构 + 消息队列** 进行了深度优化，解决了超卖、缓存穿透 / 击穿、数据一致性等核心问题。
+
+### 秒杀链路优化演进
+
+| 阶段 | 方案 | 问题 |
+|---|---|---|
+| 1.0 | 数据库悲观锁（`select ... for update`） | 请求串行化，性能极差，连接池瞬间被打满 |
+| 2.0 | 数据库乐观锁（`update ... where stock > 0`） | 解决超卖，但 DB 扛不住高并发；"一人一单"在集群下失效 |
+| 3.0 | **Redis + Lua 原子扣减 + RocketMQ 异步落库（最终方案）** | 毫秒级 Redis 操作完成资格校验与扣减，MQ 削峰异步写库 |
+
+---
+
+## 技术栈
+
+| 组件 | 版本 | 用途 |
+|---|---|---|
+| Spring Boot | 3.2.5 | 应用框架（JDK 17+） |
+| MySQL | 8.x | 业务数据存储 |
+| Redis | 6+ / 7 | 缓存、秒杀库存、限流、分布式锁、GEO、BitMap、HyperLogLog |
+| Lua | - | 秒杀库存扣减、滑动窗口限流的原子脚本 |
+| MyBatis-Plus | 3.5.5 | ORM，简化 CRUD 与分页 |
+| RocketMQ | 4.x / 5.x（starter 2.3.3） | 秒杀下单异步解耦、延迟消息 |
+| Redisson | 3.13.6 | 分布式锁（可重入 + 看门狗自动续期） |
+
+---
+
+## 功能特性
+
+### 业务功能
+
+- 商家信息查询 / 新增 / 更新，按类型、按名称、按地理位置（GEO 5km 内）查询
+- 优惠券秒杀（核心），支持秒杀时间校验、一人一单、不超卖
+- 推广博客：发布 / 点赞（ZSet 排行榜）/ 关注 / 好友 Feed 流（推模式）
+- 用户体系：短信验证码登录、Token 刷新、签到（BitMap）、UV 统计（HyperLogLog）
+
+### 高并发优化亮点
+
+| 亮点 | 方案 | 代码位置 |
+|---|---|---|
+| 不超卖 + 一人一单 | Redis + Lua 原子脚本 | `seckill.lua` |
+| 下单异步削峰 | RocketMQ 延迟消息解耦落库 | `VoucherOrderServiceImpl`、`SeckillVoucherListener` |
+| 缓存击穿 | 逻辑过期 + 互斥锁 + 线程池异步重建 | `CacheClient#queryWithLogicalExpire` |
+| 缓存穿透 | 缓存空值 + 短 TTL | `CacheClient#queryWithPassThrough` |
+| 接口限流 | 滑动窗口（注解 + AOP + Lua），支持全局 / IP / 用户维度 | `RateLimitAspect`、`rateLimit.lua` |
+| 超时关单 | Spring Task 定时扫描 + 乐观锁，释放被占库存 | `OrderTimeoutTask` |
+| 数据一致性对账 | 定时比对 Redis 与 DB，以 Redis 为准修正 | `StockReconcileTask` |
+| 全局唯一 ID | 时间戳 + 自增序列号（64 位） | `RedisIdWorker` |
+| 分布式锁 | 自研 SETNX 锁 → Redisson（可重入 + 看门狗） | `SimpleRedisLock`、`RedissonConfig` |
 
 ---
 
@@ -39,8 +90,8 @@
 
 | 组件 | 版本 | 说明 |
 |---|---|---|
-| JDK | 17+（本仓库用 21 验证） | Lombok 需 ≥ 1.18.30 才支持 JDK 21 |
-| Maven | 3.x | IDEA 内置即可 |
+| JDK | 17+（仓库用 21 验证） | Lombok 需 ≥ 1.18.30 才支持 JDK 21 |
+| Maven | 3.x | 可直接使用 IDEA 内置 Maven |
 | MySQL | 8.x | 库名 `dingping`，脚本见 `src/main/resources/db/hmdp.sql` |
 | Redis | 6+ | 若设了密码，需同步到配置 |
 | RocketMQ | 4.x / 5.x | NameServer `127.0.0.1:9876` |
@@ -49,215 +100,154 @@
 
 1. 启动 RocketMQ NameServer + Broker（端口 9876 / 10911）。
 2. 启动 MySQL、Redis。
-3. 修改 `src/main/resources/application.yaml` 中的数据库 / Redis / RocketMQ 连接信息。
-4. 运行 `com.hmdp.HmDianPingApplication`，访问 `http://localhost:8081`。
+3. 执行 `src/main/resources/db/hmdp.sql` 初始化数据库。
+4. 修改 `src/main/resources/application.yaml` 中的数据库 / Redis / RocketMQ 连接信息。
+5. 运行 `com.hmdp.HmDianPingApplication`，访问 `http://localhost:8081`。
 
 ---
 
-## 秒杀核心流程（本项目最难点）
+## 项目结构
 
-秒杀优惠券的下单链路，经历了 **三个阶段** 的演进：
+```
+src/main/java/com/hmdp/
+├── annotation/        # 自定义注解（@RateLimit）
+├── aspect/            # AOP 切面（RateLimitAspect 滑动窗口限流）
+├── config/            # 配置类（Mvc / MyBatis / Redisson / 全局异常）
+├── controller/        # Web 层（Shop / Voucher / VoucherOrder / User / Blog ...）
+├── dto/               # 传输对象（Result / UserDTO ...）
+├── entity/            # 实体（Shop / Voucher / VoucherOrder / SeckillVoucher ...）
+├── enums/             # 枚举（LimitType 限流维度）
+├── exception/         # 业务异常（RateLimitException）
+├── interceptor/       # 拦截器（登录校验 / Token 刷新）
+├── job/               # 定时任务（OrderTimeoutTask 关单 / StockReconcileTask 对账）
+├── listener/          # MQ 消费者（SeckillVoucherListener 秒杀订单落库）
+├── mapper/            # MyBatis-Plus Mapper
+├── service/           # 业务接口 + 实现
+├── utils/             # 工具类（CacheClient / RedisIdWorker / RedisConstants / UserHolder ...）
+└── resources/
+    ├── db/hmdp.sql    # 数据库脚本
+    ├── seckill.lua    # 秒杀原子扣减脚本
+    ├── rateLimit.lua  # 滑动窗口限流脚本
+    └── application.yaml
+```
 
-1. **数据库悲观锁**：`select ... for update`。请求串行化，性能极差，连接池瞬间被打满。
-2. **数据库乐观锁（CAS）**：`update ... where stock > 0`。解决了超卖，但数据库依然扛不住高并发读写；且"一人一单"在集群下失效（JVM 锁锁不住）。
-3. **Redis + Lua + RocketMQ 异步架构（最终方案）**：
-   - 用 **Lua 脚本的原子性**，在 Redis 内存中完成"库存判断 + 一人一单校验 + 扣库存 + 记录用户"。
-   - 校验通过后，发送消息到 **RocketMQ**，**立即给前端返回"排队中 / 订单号"**。
-   - 后端消费者慢慢消费消息，异步写入 MySQL。
+---
 
-**收益**：把同步的 DB 读写转成毫秒级的 Redis 操作，用消息队列削峰。
+## 核心设计
 
-核心代码：
-- `src/main/resources/seckill.lua` —— 原子校验脚本
-- `VoucherOrderServiceImpl#seckillVoucher` —— 入口（Lua 执行 + 发 MQ）
-- `SeckillVoucherListener` —— RocketMQ 消费者（异步落库）
+### 1. 秒杀：Redis + Lua 原子扣减 + RocketMQ 异步落库
 
-### 为什么 Redis 里就能保证"不超卖 + 一人一单"？
-
-* **库存信息**：`seckill:stock:{voucherId}`（String，当前库存）
-* **下单用户**：`seckill:order:{voucherId}`（Set，所有购买过的 userId）
-
-Lua 脚本里 `get` 库存 → `sismember` 判断是否买过 → `incrby -1` 扣库存 → `sadd` 记用户，这几步在 Redis 中**原子执行**，天然避免并发竞态，也因此**不再需要分布式锁**。
+秒杀链路拆成"判断资格（Redis）→ 异步落库（MQ）"两步，核心逻辑：
 
 ```lua
-if (redis.call('sismember', orderKey, userId) == 1) then  -- 一人一单
+-- seckill.lua：原子执行，天然避免并发竞态
+local stock  = redis.call('get', stockKey)               -- 库存判断
+if (stock <= 0) then return 1 end
+if (redis.call('sismember', orderKey, userId) == 1) then -- 一人一单
     return 2
 end
-if (stock <= 0) then                                      -- 库存判断
-    return 1
-end
-redis.call('incrby', stockKey, -1)                        -- 扣库存
-redis.call('sadd', orderKey, userId)                      -- 记录用户
+redis.call('incrby', stockKey, -1)                       -- 扣库存
+redis.call('sadd', orderKey, userId)                     -- 记录用户
 ```
 
----
+- **库存**：`seckill:stock:{voucherId}`（String）；**已购用户**：`seckill:order:{voucherId}`（Set）。
+- Lua 在 Redis 中原子执行"库存判断 + 一人一单 + 扣减 + 记录"，**无需分布式锁**。
+- 校验通过后发 RocketMQ（延迟级别 3 ≈ 10s），立即返回订单号给前端，消费者异步落库。
 
-## 缓存：穿透 / 击穿 / 雪崩
+### 2. 消息可靠性：幂等、丢失、最终一致
 
-### 缓存穿透（查不存在的 key）
+- **幂等**：订单 ID 为主键，重复消费写入失败天然跳过。
+- **丢失兜底**：核心约束（不超卖 + 一人一单）由 Redis + Lua 保证，不受 MQ 丢失影响；DB 副本漂移由 **对账任务** 定期修正（见 §6）。
+- **消费延迟兜底**：延迟级别 3（≈10s）模拟"下单后延迟落库"，用户支付回调时若 DB 尚无订单，可利用回调信息反向生成"已支付"订单。
 
-恶意请求不存在的商铺 ID 会直接打到数据库。**方案：缓存空值**。
-- 参考：`CacheClient#queryWithPassThrough`
-- 查不到时写 `""` 到 Redis，TTL 短一点（`CACHE_NULL_TTL`），避免长期占用内存。
-- 为什么不用布隆过滤器：有误判率、需引入新组件维护，本商铺量级缓存空值更简单。
+### 3. 缓存：穿透 / 击穿 / 雪崩
 
-### 缓存击穿（热点 key 失效瞬间）
-
-热点 Key TTL 过期瞬间，大量请求同时重建缓存。**方案：逻辑过期 + 互斥锁 + 异步重建**。
-- 参考：`CacheClient#queryWithLogicalExpire`
-- 不给 Redis 设物理 TTL，而是把过期时间存在 value 里（`RedisData{data, expireTime}`）。
-- 取到数据后判断逻辑过期：
-  - 未过期 → 直接返回旧数据。
-  - 已过期 → 抢**互斥锁**（`SETNX`），拿到锁的线程**开独立线程池异步重建缓存**，所有请求**立即返回旧数据**（高可用）。
-
-**方案对比（CAP 取舍）**：
-- **互斥锁**：保一致性，牺牲可用性（重建期间请求阻塞）。
-- **逻辑过期**：保可用性，牺牲一致性（用户可能看到 2 秒前的旧数据）。
-
-秒杀详情 / 热搜榜这类**社交媒体数据不要求强一致**，故选择 **AP（重可用性）** 的逻辑过期方案。
-
-### 缓存雪崩（大量 key 同时失效）
-
-处理手段：TTL 加随机值、热点数据用逻辑过期（无物理 TTL）、Redis 前加本地缓存、Redis 宕机时限流降级。
-
----
-
-## 异步下单：Redis + Lua + RocketMQ
-
-秒杀链路是**同步流程**：判断资格 → 扣库存 → 生成订单。其中"扣库存 + 生成订单"是两次 MySQL 写操作，在高并发下是性能瓶颈。
-
-**优化**：判断完资格（Redis + Lua 已保证不超卖、一人一单）后，**用户秒杀即成功**。至于 MySQL 的库存扣减和订单生成，完全可以异步做——发一条 RocketMQ 消息，消费者慢慢落库。
-
-```java
-// VoucherOrderServiceImpl#seckillVoucher —— 秒杀成功，发消息，立即返回
-rocketMQTemplate.syncSend(
-    "seckill-order-topic:seckill",            // topic:tag
-    MessageBuilder.withPayload(jsonStr).build(),
-    3000,                                       // 发送超时
-    3                                           // 延迟级别 3 ≈ 10s
-);
-return Result.ok(orderId);                     // 立即返回订单号
-```
-
-**关于 RocketMQ 延迟消息**：这里指定了 `delayLevel=3`（约 10 秒）。RocketMQ 原生支持延迟消息，因此"秒杀下单后延迟落库"不需要额外搭建延迟队列，架构更简洁。
-
-消费者 `SeckillVoucherListener` 收到消息后：
-1. `save` 订单（订单 ID 是主键，重复消费天然幂等）。
-2. CAS 扣减数据库库存：`update ... set stock = stock - 1 where stock > 0`。
-
----
-
-## 消息可靠性：幂等、丢失、最终一致
-
-### 1. 重复消费怎么办？（幂等）
-
-RocketMQ 保证 **At Least Once**，网络波动时可能重复投递。
-- 发送消息时携带**唯一订单 ID**（RedisIdWorker 生成）。
-- 消费者 `save` 时，订单 ID 是**主键**，重复消费第二次写入因主键冲突失败 → 判定为重复消息 → 跳过。
-- 参考：`VoucherOrder` 主键 `id`。
-
-### 2. 消息丢了，MySQL 数据不一致怎么办？
-
-秒杀核心要求（不超卖 + 一人一单）**由 Redis + Lua 保证，不受影响**——即使 MQ 丢了消息，Redis 里库存已扣。
-- 丢消息只影响 **MySQL 的最终一致性**（库存对不上、订单没生成）。
-- 兜底：秒杀结束后跑**定时任务对账**，比对 Redis 库存 / 下单记录与 MySQL 是否一致，不一致则修复。这就是"对账思想"。
-- 如果用了 RocketMQ **事务消息 + 本地消息表**，可以做到强一致；但秒杀场景对强一致要求不高，本方案更简单。
-
-### 3. 用户支付后订单记录还没生成怎么办？
-
-用户支付本身不依赖数据库订单记录。后台生成唯一订单 ID 后调用第三方接口生成支付凭证；若支付回调时数据库无此订单（MQ 还在排队），可利用回调信息**反向生成"已支付"订单**。
-
----
-
-## 订单超时关闭与并发控制
-
-未支付订单超时需要关闭并释放库存。调研过的方案：
-
-| 方案 | 结论 |
-|---|---|
-| **Spring Task 定时扫描** | **采用**。单体订单量不大，简单稳健；加好联合索引效率足够 |
-| RocketMQ 延迟消息 | 大量无效调度（多数订单已支付），极端情况可能丢消息 |
-| Redis 过期监听 | 惰性删除不保证实时，不可靠 |
-
-**重复关闭 / 重复加库存？** 不会：`update orders set status='取消' where id=? and status='未支付'`，只有影响行数 > 0 才释放库存。
-
-**关单和支付并发的"二选一"**（乐观锁）：
-- 超时关单：`update ... set status='取消' where id=? and status='未支付'`
-- 支付成功：`update ... set status='已支付' where id=? and status='未支付'`
-
-利用数据库行锁，两个 SQL 只有一个成功。若"关单成功但用户已支付"，系统应触发**原路退回**，不能强改已支付（否则超卖）。
-
----
-
-## 分布式锁选型
-
-下单 / 关单等操作需要保证同一用户串行，因此引入分布式锁。演进：
-
-1. **自研 SETNX 锁**：`SimpleRedisLock`（`SET key value NX EX 10` + Lua 释放）。问题：没有看门狗自动续期，锁超时可能误删他人锁。
-2. **Redisson**：**可重入 + 看门狗自动续期**（默认 30s，每 10s 续一次），业务没跑完锁不会过期。
-
-```java
-RLock lock = redissonClient.getLock("lock:order:" + userId);
-boolean isLock = lock.tryLock();
-try { ... } finally { lock.unlock(); }
-```
-
-> 注：秒杀下单链路本身因为用了 Redis + Lua 原子判断，**不再需要分布式锁**（Lua 已保证并发安全）；分布式锁仍用于其他需要串行的业务场景。
-
----
-
-## 全局唯一 ID 生成
-
-`RedisIdWorker`：**时间戳 + 序列号** 的 64 位 ID（类似雪花算法）。
-
-- 高位：当前时间戳与固定起始时间戳之差。
-- 低位：`INCR` 按天自增的序列号（`icr:order:2026:08:21`），避免跨天溢出。
-- 为什么不用数据库自增：分布式下重复、且暴露规则。
-
-```java
-long timestamp = nowSecond - BEGIN_TIMESTAMP;   // 41 位时间戳
-Long count = stringRedisTemplate.opsForValue()
-        .increment("icr:" + keyPrefix + ":" + date);  // 序列号
-return timestamp << COUNT_BITS | count;         // 64 位 ID
-```
-
----
-
-## 其他 Redis 特性应用
-
-| 功能 | Redis 数据结构 | 实现 |
+| 问题 | 方案 | 取舍 |
 |---|---|---|
-| 点赞排行榜 | ZSet | `ZADD key score(时间戳) value(userId)`，`ZREVRANGE` 取 Top |
-| 共同关注 | Set | `SINTER keyA keyB` 求交集 |
-| 附近商户 | GEO | `GEOSEARCH` 5km 内按距离排序（GeoHash） |
-| 用户签到 | BitMap | 1 bit 代表一天，`SETBIT` |
-| UV 统计 | HyperLogLog | `PFADD` / `PFCOUNT`，12KB 统计海量数据 |
+| 穿透（查不存在 key） | 缓存空值 + 短 TTL（`CACHE_NULL_TTL`） | 相比布隆过滤器无误判率、无新组件依赖 |
+| 击穿（热点 key 失效瞬间） | 逻辑过期（TTL 存 value）+ 互斥锁 + 线程池异步重建 | 保可用性，牺牲瞬时一致性（AP） |
+| 雪崩（大量 key 同时失效） | TTL 加随机值 + 热点逻辑过期 + 降级 | - |
+
+### 4. 滑动窗口限流（注解 + AOP + Lua）
+
+```java
+@RateLimit(time = 1, count = 5, limitType = LimitType.IP) // 单 IP 每秒最多 5 次
+public Result seckillVoucher(@PathVariable("id") Long voucherId) { ... }
+```
+
+- 切面 `RateLimitAspect` 拦截 `@RateLimit` 注解，执行 `rateLimit.lua`。
+- Lua 滑动窗口：`ZREMRANGEBYSCORE` 清窗口外 → `ZADD` 记当前时间戳 → `ZCARD` 统计，原子计数，杜绝并发超限。
+- 支持 `DEFAULT`（全局）/ `IP` / `USER` 三维度，超限返回 HTTP 429。
+
+### 5. 超时订单自动关闭
+
+`OrderTimeoutTask` 每 1 分钟扫描超时（15 分钟）未支付订单，**乐观锁 + 幂等**三步释放库存：
+
+1. `update tb_voucher_order set status=4 where id=? and status=1` —— 与支付回调互斥，只关未支付
+2. `update tb_seckill_voucher set stock=stock+1 where voucher_id=?` —— DB 库存回补
+3. Redis 回补：`INCR seckill:stock` + `SREM seckill:order` —— 释放一人一单资格
+
+依赖 `tb_voucher_order(status, create_time)` 联合索引，避免全表扫描。
+
+### 6. 数据一致性对账
+
+`StockReconcileTask` 每 10 分钟比对所有秒杀券的 Redis 与 DB：
+
+- **比对项**：Redis 库存 / Redis 下单集合大小 vs DB 库存 / DB 有效订单数（未取消）。
+- **修正**：以 Redis 为准回写 DB 库存（Redis 是不超卖的唯一权威）。
+- **告警**：Redis 下单数 > DB 有效订单数 → 疑似 MQ 消息丢失，输出 ERROR 日志人工复核。
+
+### 7. 全局唯一 ID 与分布式锁
+
+- **RedisIdWorker**：41 位时间戳 + 按天自增序列号组成的 64 位 ID（类雪花），替代数据库自增，避免分布式重复。
+- **分布式锁**：自研 `SimpleRedisLock`（SETNX + Lua 释放）→ 演进为 Redisson（可重入 + 看门狗自动续期）。秒杀下单链路因 Lua 原子性不再需要分布式锁，锁仍用于其他需串行的场景。
+
+---
+
+## 性能与稳定性
+
+- **削峰**：秒杀写路径从"两次 DB 写"变为"一次 Redis 原子操作 + 一条 MQ 消息"，核心接口吞吐量不再受 DB 连接池瓶颈制约。
+- **抗超卖**：库存扣减与一人一单校验在 Redis 原子完成，不依赖 DB 行锁。
+- **缓存保护**：穿透 / 击穿均有兜底，热点 key 失效不击穿 DB。
+- **限流防护**：刷券、爬虫等异常流量在入口被滑动窗口拦截，防止系统过载。
+
+> 说明：仓库不内置压测脚本与性能数据。若要量化"优化效果"，建议配合 JMeter 对本机秒杀接口做并发压测，对比 MySQL 直连与 Redis+Lua 两版的吞吐 / RT 数据。
 
 ---
 
 ## 实现状态清单
 
-> 以下区分 **已落地为代码** 与 **设计思考**，与仓库代码严格对应。
+> 与仓库代码严格对应，如实区分「已实现」与「设计思考」。
 
 | 设计 | 状态 |
 |---|---|
 | Redis + Lua 秒杀（不超卖 / 一人一单） | ✅ 已实现（`seckill.lua` + `VoucherOrderServiceImpl`） |
-| RocketMQ 异步下单 | ✅ 已实现（`RocketMQTemplate` + `SeckillVoucherListener`） |
+| RocketMQ 异步下单（延迟消息） | ✅ 已实现（`RocketMQTemplate` + `SeckillVoucherListener`） |
 | 全局唯一 ID | ✅ 已实现（`RedisIdWorker`） |
-| 逻辑过期缓存 | ✅ 已实现（`CacheClient#queryWithLogicalExpire`） |
-| 缓存穿透（空值） | ✅ 已实现（`CacheClient#queryWithPassThrough`） |
-| 分布式锁 | ✅ 已实现（`SimpleRedisLock` + Redisson） |
+| 逻辑过期缓存（防击穿） | ✅ 已实现（`CacheClient#queryWithLogicalExpire`） |
+| 缓存空值（防穿透） | ✅ 已实现（`CacheClient#queryWithPassThrough`） |
+| 滑动窗口限流（注解 + 切面 + Lua） | ✅ 已实现（`RateLimitAspect` + `rateLimit.lua`） |
+| 超时订单定时关单（Spring Task） | ✅ 已实现（`OrderTimeoutTask`） |
+| 秒杀数据对账（Redis 权威修正） | ✅ 已实现（`StockReconcileTask`） |
+| 分布式锁（SETNX → Redisson） | ✅ 已实现（`SimpleRedisLock` + Redisson） |
 | 登录 / 点赞 / 关注 / 附近 / 签到 / UV | ✅ 已实现 |
-| 滑动窗口限流（注解 + 切面 + Lua） | ⬜ 设计思考，代码未实现 |
-| Caffeine 二级缓存 | ⬜ 设计思考，代码未实现（见下） |
-| 订单超时定时关单（Spring Task） | ⬜ 设计思考，代码未实现 |
-
-**为什么二级缓存、限流、定时关单没落地？**
-- 它们针对的是**更大规模的部署场景**（多实例、更高并发、更强风控），当前单体 + 单实例架构下收益有限，属于"做了更好的架构演进"的一部分。README 里记录了完整设计取舍，面试可讲思路。
-- 若需要，可以按 README 的思路继续落地。
+| 支付回调并发控制（乐观锁） | ⬜ 设计思考，代码未实现（见「后续计划」） |
+| 缓存删除失败 MQ 补偿重试 | ⬜ 设计思考，代码未实现（见「后续计划」） |
+| Caffeine 本地二级缓存 | ⬜ 设计思考，代码未实现（见「后续计划」） |
 
 ---
 
-## 免责声明
+## 后续计划
 
-本项目为学习 / 面试用途，业务逻辑参考了经典"大众点评"系统。代码中的设计取舍（缓存、秒杀、锁、消息队列）均有真实压测 / 日志佐证，欢迎交流指正。
+以下方案针对 **更大规模部署场景**（多实例、更高并发、更强风控），当前单体架构下暂未落地，README 记录设计取舍，可随时按需实现：
+
+- **支付回调 + 关单并发控制（乐观锁）**：支付回调与超时关单通过 `update ... where status='未支付'` 实现"二选一"，配合原路退回保证不超卖。
+- **缓存删除失败 MQ 补偿**：DB 更新后删缓存失败时发 MQ 重试删除，结合 TTL 兜底保证最终一致。
+- **Caffeine 本地二级缓存**：Redis 前加本地缓存，进一步降低热点 key 的 Redis 压力。
+- **RocketMQ 事务消息 + 本地消息表**：将"下单"与"发消息"强一致，替代当前对账兜底。
+
+---
+
+## License
+
+本项目为学习 / 面试用途，业务逻辑参考经典"大众点评"系统。基于 [MIT](LICENSE) 协议开源。
