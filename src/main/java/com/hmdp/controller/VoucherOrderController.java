@@ -2,11 +2,13 @@ package com.hmdp.controller;
 
 
 import com.hmdp.annotation.RateLimit;
+import com.hmdp.dto.PayCallbackDTO;
 import com.hmdp.dto.Result;
 import com.hmdp.enums.LimitType;
 import com.hmdp.service.IVoucherOrderService;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
 
@@ -29,5 +31,16 @@ public class VoucherOrderController {
     @RateLimit(time = 1, count = 5, limitType = LimitType.IP) // 单 IP 每秒最多 5 次，防刷券
     public Result seckillVoucher(@PathVariable("id") Long voucherId) {
         return voucherOrderService.seckillVoucher(voucherId);
+    }
+
+    /**
+     * 支付成功回调（模拟第三方支付平台回调）
+     * <p>
+     * 生产环境应校验签名并保证幂等，此处演示乐观锁状态流转。
+     * </p>
+     */
+    @PostMapping("pay/callback")
+    public Result payCallback(@RequestBody PayCallbackDTO payCallbackDTO) {
+        return voucherOrderService.payCallback(payCallbackDTO);
     }
 }

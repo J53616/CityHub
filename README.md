@@ -77,8 +77,10 @@ CityHub 是一个类"大众点评"的本地生活服务平台，提供商家信�
 | 缓存击穿 | 逻辑过期 + 互斥锁 + 线程池异步重建 | `CacheClient#queryWithLogicalExpire` |
 | 缓存穿透 | 缓存空值 + 短 TTL | `CacheClient#queryWithPassThrough` |
 | 接口限流 | 滑动窗口（注解 + AOP + Lua），支持全局 / IP / 用户维度 | `RateLimitAspect`、`rateLimit.lua` |
-| 超时关单 | Spring Task 定时扫描 + 乐观锁，释放被占库存 | `OrderTimeoutTask` |
+| 超时关单 | RocketMQ 延迟消息精准触发 + Spring Task 定时扫描兜底，乐观锁释放库存 | `OrderTimeoutListener`、`OrderTimeoutTask` |
 | 数据一致性对账 | 定时比对 Redis 与 DB，以 Redis 为准修正 | `StockReconcileTask` |
+| 缓存删除补偿 | 删缓存失败发 RocketMQ 重试 + 物理 TTL 兜底 | `ShopServiceImpl#update`、`CacheDeleteListener` |
+| 支付回调 | 乐观锁状态流转，与超时关单并发互斥 | `VoucherOrderServiceImpl#payCallback` |
 | 全局唯一 ID | 时间戳 + 自增序列号（64 位） | `RedisIdWorker` |
 | 分布式锁 | 自研 SETNX 锁 → Redisson（可重入 + 看门狗） | `SimpleRedisLock`、`RedissonConfig` |
 
@@ -179,15 +181,20 @@ public Result seckillVoucher(@PathVariable("id") Long voucherId) { ... }
 - Lua 滑动窗口：`ZREMRANGEBYSCORE` 清窗口外 → `ZADD` 记当前时间戳 → `ZCARD` 统计，原子计数，杜绝并发超限。
 - 支持 `DEFAULT`（全局）/ `IP` / `USER` 三维度，超限返回 HTTP 429。
 
-### 5. 超时订单自动关闭
+### 5. 超时订单自动关闭（延迟消息 + 定时兜底）
 
-`OrderTimeoutTask` 每 1 分钟扫描超时（15 分钟）未支付订单，**乐观锁 + 幂等**三步释放库存：
+**双保险机制**：
+
+1. **RocketMQ 延迟消息精准触发（主）**：秒杀下单时发送一条 `delayLevel=14`（≈10 分钟）的延迟消息到 `seckill-order-close-topic`，到期由 `OrderTimeoutListener` 消费并检查关单——在超时时刻精准触发，避免定时轮询的轮询间隔误差。
+2. **Spring Task 定时扫描（兜底）**：`OrderTimeoutTask` 每 1 分钟扫描超时（10 分钟）未支付订单，兜底延迟消息丢失 / 消费失败的场景。
+
+两路统一走 `IVoucherOrderService#closeTimeoutOrder`（**乐观锁 + 幂等**）三步释放库存：
 
 1. `update tb_voucher_order set status=4 where id=? and status=1` —— 与支付回调互斥，只关未支付
 2. `update tb_seckill_voucher set stock=stock+1 where voucher_id=?` —— DB 库存回补
 3. Redis 回补：`INCR seckill:stock` + `SREM seckill:order` —— 释放一人一单资格
 
-依赖 `tb_voucher_order(status, create_time)` 联合索引，避免全表扫描。
+定时扫描依赖 `tb_voucher_order(status, create_time)` 联合索引，避免全表扫描。
 
 ### 6. 数据一致性对账
 
@@ -197,7 +204,24 @@ public Result seckillVoucher(@PathVariable("id") Long voucherId) { ... }
 - **修正**：以 Redis 为准回写 DB 库存（Redis 是不超卖的唯一权威）。
 - **告警**：Redis 下单数 > DB 有效订单数 → 疑似 MQ 消息丢失，输出 ERROR 日志人工复核。
 
-### 7. 全局唯一 ID 与分布式锁
+### 7. 缓存删除失败补偿（Cache Aside 一致性）
+
+更新 DB 后删除缓存失败会导致旧数据长期驻留（本仓库店铺缓存用的是逻辑过期，无物理 TTL，风险更大）。`ShopServiceImpl#update` 的删除缓存步骤做了三层兜底：
+
+1. **同步删除**：DB 更新后立即 `delete` 缓存。
+2. **RocketMQ 补偿**：删除失败时发消息到 `cache-delete-topic`，`CacheDeleteListener` 消费后重试删除，失败抛异常由 RocketMQ 重投。
+3. **物理 TTL 兜底**：写入逻辑过期缓存时同时设置"逻辑过期 + 60s 余量"的物理 TTL（`CacheClient#setWithLogicalExpire`），即使补偿也失败，缓存最终也会被物理过期淘汰，保证最终一致。
+
+### 8. 支付回调乐观锁（并发状态流转）
+
+支付成功回调与超时关单可能并发。利用 **数据库行锁 + CAS 条件** 实现"二选一"：
+
+- 支付回调：`update tb_voucher_order set status=2 where id=? and status=1`（未支付 → 已支付）
+- 超时关单：`update tb_voucher_order set status=4 where id=? and status=1`（未支付 → 已取消）
+
+两个 SQL 同时执行时只有一方更新成功。若支付回调落在已取消订单上（影响 0 行），触发**原路退回**（退款），避免"用户已付款但库存被释放"的超卖风险。参见 `VoucherOrderServiceImpl#payCallback`。
+
+### 9. 全局唯一 ID 与分布式锁
 
 - **RedisIdWorker**：41 位时间戳 + 按天自增序列号组成的 64 位 ID（类雪花），替代数据库自增，避免分布式重复。
 - **分布式锁**：自研 `SimpleRedisLock`（SETNX + Lua 释放）→ 演进为 Redisson（可重入 + 看门狗自动续期）。秒杀下单链路因 Lua 原子性不再需要分布式锁，锁仍用于其他需串行的场景。
@@ -229,10 +253,10 @@ public Result seckillVoucher(@PathVariable("id") Long voucherId) { ... }
 | 滑动窗口限流（注解 + 切面 + Lua） | ✅ 已实现（`RateLimitAspect` + `rateLimit.lua`） |
 | 超时订单定时关单（Spring Task） | ✅ 已实现（`OrderTimeoutTask`） |
 | 秒杀数据对账（Redis 权威修正） | ✅ 已实现（`StockReconcileTask`） |
+| 缓存删除失败 MQ 补偿 + 物理 TTL 兜底 | ✅ 已实现（`ShopServiceImpl#update` + `CacheDeleteListener`） |
+| 支付回调乐观锁（状态流转 / 退款） | ✅ 已实现（`VoucherOrderServiceImpl#payCallback`） |
 | 分布式锁（SETNX → Redisson） | ✅ 已实现（`SimpleRedisLock` + Redisson） |
 | 登录 / 点赞 / 关注 / 附近 / 签到 / UV | ✅ 已实现 |
-| 支付回调并发控制（乐观锁） | ⬜ 设计思考，代码未实现（见「后续计划」） |
-| 缓存删除失败 MQ 补偿重试 | ⬜ 设计思考，代码未实现（见「后续计划」） |
 | Caffeine 本地二级缓存 | ⬜ 设计思考，代码未实现（见「后续计划」） |
 
 ---
@@ -241,10 +265,9 @@ public Result seckillVoucher(@PathVariable("id") Long voucherId) { ... }
 
 以下方案针对 **更大规模部署场景**（多实例、更高并发、更强风控），当前单体架构下暂未落地，README 记录设计取舍，可随时按需实现：
 
-- **支付回调 + 关单并发控制（乐观锁）**：支付回调与超时关单通过 `update ... where status='未支付'` 实现"二选一"，配合原路退回保证不超卖。
-- **缓存删除失败 MQ 补偿**：DB 更新后删缓存失败时发 MQ 重试删除，结合 TTL 兜底保证最终一致。
 - **Caffeine 本地二级缓存**：Redis 前加本地缓存，进一步降低热点 key 的 Redis 压力。
 - **RocketMQ 事务消息 + 本地消息表**：将"下单"与"发消息"强一致，替代当前对账兜底。
+- **支付渠道对接**：支付回调目前为模拟接口，未接真实支付宝 / 微信的验签、退款等能力。
 
 ---
 
