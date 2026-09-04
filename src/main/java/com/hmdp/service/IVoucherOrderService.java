@@ -17,8 +17,6 @@ public interface IVoucherOrderService extends IService<VoucherOrder> {
 
     Result seckillVoucher(Long voucherId);
 
-    void createVoucherOrder(VoucherOrder voucherOrder);
-
     /**
      * 支付成功回调：乐观锁更新订单状态为已支付
      *

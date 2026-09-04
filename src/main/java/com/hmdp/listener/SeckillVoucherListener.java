@@ -13,9 +13,8 @@ import org.springframework.stereotype.Component;
 /**
  * 秒杀订单异步消费者
  * <p>
- * 原 RabbitMQ 版通过 QA(10s TTL 死信 → QD)实现延时消费；
- * RocketMQ 版本利用 broker 端的延迟消息机制（发送时指定延迟级别 3 ≈ 10s），
- * 消费者收到消息即说明延迟已过，直接落库 + CAS 扣库存。
+ * 原 RabbitMQ 版通过 QA(10s TTL 死信 → QD)实现延时落库；RocketMQ 版本落库消息立即投递
+ * （delayLevel=0），仅借异步解耦削峰，消费者直接落库 + CAS 扣库存，保证订单尽快可见。
  * </p>
  */
 @Component

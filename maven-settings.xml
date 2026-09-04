@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<settings xmlns="http://maven.apache.org/SETTINGS/1.0.0"
+          xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+          xsi:schemaLocation="http://maven.apache.org/SETTINGS/1.0.0 http://maven.apache.org/xsd/settings-1.0.0.xsd">
+  <!--
+    CityHub 项目专用 Maven 配置。
+    说明：本机默认 ~/.m2/settings.xml 里把阿里云镜像设为 blocked=true，
+    会导致命令行 mvn 无法解析依赖（只能 IDEA 编译）。这里用干净的配置绕过。
+    如需阿里云加速，可把下面的 mirror 取消注释并去掉 blocked。
+  -->
+  <localRepository>${user.home}/.m2/repository</localRepository>
+
+  <!-- 如需阿里云镜像加速，取消注释即可：
+  <mirrors>
+    <mirror>
+      <id>aliyunmaven</id>
+      <mirrorOf>central</mirrorOf>
+      <name>Aliyun Maven Central Mirror</name>
+      <url>https://maven.aliyun.com/repository/public</url>
+    </mirror>
+  </mirrors>
+  -->
+</settings>

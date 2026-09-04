@@ -144,11 +144,11 @@ public class CacheClient {
             String keyPrefix, ID id, Class<R> type, Function<ID, R> dbFallback, Long time, TimeUnit unit) {
         String key = keyPrefix + id;
         String json = stringRedisTemplate.opsForValue().get(key);
-        // 1.缓存 miss（可能是穿透请求，也可能是缓存未预热）
-        if (StrUtil.isBlank(json)) {
+        // 1.缓存 miss：仅当 key 完全不存在（get 返回 null）才回源 DB
+        if (json == null) {
             R dbData = dbFallback.apply(id);
             if (dbData == null) {
-                // 1.1 数据库无此数据：缓存空值，短 TTL，防穿透
+                // 1.1 数据库无此数据：缓存空值（空字符串 null 标记），短 TTL，防穿透
                 stringRedisTemplate.opsForValue()
                         .set(key, "", RedisConstants.CACHE_NULL_TTL, TimeUnit.MINUTES);
                 return null;
@@ -157,14 +157,19 @@ public class CacheClient {
             this.setWithLogicalExpire(key, dbData, time, unit);
             return dbData;
         }
-        // 2.缓存命中：解析逻辑过期信息
+        // 2.命中空值标记（空字符串）：说明数据库无此数据，直接返回 null，不再回源 DB
+        //   （注意：此分支必须用 json.isEmpty() 区分于 miss，不能走 StrUtil.isBlank——否则 "" 会被当 miss 每次回源，防穿透失效）
+        if (json.isEmpty()) {
+            return null;
+        }
+        // 3.缓存命中非空数据：解析逻辑过期信息
         RedisData redisData = JSONUtil.toBean(json, RedisData.class);
         R data = JSONUtil.toBean((JSONObject) redisData.getData(), type);
         if (redisData.getExpireTime().isAfter(LocalDateTime.now())) {
-            // 2.1 未过期，直接返回
+            // 3.1 未过期，直接返回
             return data;
         }
-        // 2.2 已过期：抢互斥锁，抢到者异步重建，其余请求返回旧数据（防击穿）
+        // 3.2 已过期：抢互斥锁，抢到者异步重建，其余请求返回旧数据（防击穿）
         boolean isLock = tryLock(RedisConstants.LOCK_SHOP_KEY + id);
         if (isLock) {
             CACHE_REBUILD_EXECUTOR.submit(() -> {

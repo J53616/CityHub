@@ -61,114 +61,21 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
     private static final int STATUS_PAID = 2;
     private static final int STATUS_CANCELED = 4;
 
-    /** 落库消息 topic（秒杀下单异步落库，延迟级别 3 ≈ 10s） */
+    /** 落库消息 topic（秒杀下单异步落库，立即投递不延迟） */
     private static final String ORDER_TOPIC = "seckill-order-topic:seckill";
     /** 超时关单 topic（延迟消息驱动，消费者 OrderTimeoutListener） */
     private static final String CLOSE_ORDER_TOPIC = "seckill-order-close-topic:close";
     /** 超时关单延迟级别：14 = 10 分钟（RocketMQ 固定延迟级别表），与超时阈值一致 */
     private static final int CLOSE_DELAY_LEVEL = 14;
 
-//    //阻塞队列，线程从中获取时，如果为空，则线程阻塞
-//    private static final ExecutorService SECKILL_ORDER_EXECUTOR = Executors.newSingleThreadExecutor();
-//
-//    @PostConstruct
-//    private void init(){
-//        SECKILL_ORDER_EXECUTOR.submit(new VoucherOrderHandler());
-//    }
-//    private class VoucherOrderHandler implements Runnable {
-//        String queueName="stream.orders";
-//        @Override
-//        public void run() {
-//            while (true) {
-//                try {
-//                    //1.获取消息队列中的队列信息
-//                    //XREADGROUP GROUP g1 c1 COUNT 1 BLOCK 2000 STREAMS streams.orders >
-//                    List<MapRecord<String, Object, Object>> list = stringRedisTemplate.opsForStream().read(
-//                            Consumer.from("g1", "c1"),
-//                            StreamReadOptions.empty().count(1).block(Duration.ofSeconds(2)),
-//                            StreamOffset.create(queueName, ReadOffset.lastConsumed())
-//                    );
-//                    //2.判断消息获取是否成功
-//                    if (list == null || list.isEmpty()) {
-//                        //2.1.如果获取失败，说明没有消息，继续下一次循环
-//                        continue;
-//                    }
-//                    //3.解析消息中的订单信息
-//                    MapRecord<String, Object, Object> record = list.get(0);
-//                    Map<Object, Object> values = record.getValue();
-//                    VoucherOrder voucherOrder = BeanUtil.fillBeanWithMap(values, new VoucherOrder(), true);
-//
-//                    //4.如果获取成功，可以下单
-//                    handleVoucherOrder(voucherOrder);
-//
-//                    //5.ACK确认 SACK stream.orders g1 id
-//                    stringRedisTemplate.opsForStream().acknowledge(queueName, "g1", record.getId());
-//
-//                }catch (Exception e){
-//                    log.error("处理订单异常",e);
-//                    try {
-//                        handPendingList();
-//                    } catch (InterruptedException ex) {
-//                        throw new RuntimeException(ex);
-//                    }
-//                }
-//            }
-//
-//        }
-//
-//        private void handPendingList() throws InterruptedException {
-//            while (true) {
-//                try {
-//                    //1.获取pending-list中的队列信息
-//                    //XREADGROUP GROUP g1 c1 COUNT 1 STREAMS streams.orders 0
-//                    List<MapRecord<String, Object, Object>> list = stringRedisTemplate.opsForStream().read(
-//                            Consumer.from("g1", "c1"),
-//                            StreamReadOptions.empty().count(1),
-//                            StreamOffset.create(queueName, ReadOffset.from("0"))
-//                    );
-//                    //2.判断消息获取是否成功
-//                    if (list == null || list.isEmpty()) {
-//                        //2.1.如果获取失败，说明pending-list没有消息，结束循环
-//                        break;
-//                    }
-//                    //3.解析消息中的订单信息
-//                    MapRecord<String, Object, Object> record = list.get(0);
-//                    Map<Object, Object> values = record.getValue();
-//                    VoucherOrder voucherOrder = BeanUtil.fillBeanWithMap(values, new VoucherOrder(), true);
-//
-//                    //4.如果获取成功，可以下单
-//                    handleVoucherOrder(voucherOrder);
-//
-//                    //5.ACK确认 SACK stream.orders g1 id
-//                    stringRedisTemplate.opsForStream().acknowledge(queueName, "g1", record.getId());
-//                }catch (Exception e){
-//                    log.error("处理pending-list订单异常",e);
-//                    Thread.sleep(20);
-//                }
-//            }
-//        }
-//    }
-   /* private BlockingQueue<VoucherOrder> orderTasks=new ArrayBlockingQueue<>(1024*1024);
-    private class VoucherOrderHandler implements Runnable {
-
-        @Override
-        public void run() {
-            while (true) {
-                try {
-                    //1.获取队列中的队列信息
-                    VoucherOrder order = orderTasks.take();
-                    //2.创建订单
-                    handleVoucherOrder(order);
-
-                } catch (InterruptedException e) {
-                    log.error("处理订单异常", e);
-                }
-
-            }
-
-        }
-    }*/
-
+    /**
+     * 秒杀链路演进（历史实现已删除，完整旧代码见 git 历史）：
+     * <ol>
+     *   <li>资格校验与扣减：DB 悲观锁 → DB 乐观锁 → Redis+Lua 原子脚本（当前，见 seckill.lua）；</li>
+     *   <li>异步落库：曾尝试 Redis Stream 消费者、JVM 阻塞队列，最终采用 RocketMQ 立即投递解耦削峰；</li>
+     *   <li>一人一单：曾用 Redisson 分布式锁串行化，后由 Lua 原子脚本替代，不再需要分布式锁。</li>
+     * </ol>
+     */
     @Override
     public Result seckillVoucher(Long voucherId) {
         //获取用户id
@@ -188,7 +95,14 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
         }
         if(r!=0){
             //2.1.不为0，代表没有购买资格
-            return Result.fail(r==1?"库存不足":"不能重复下单");
+            if (r == 1) {
+                return Result.fail("库存不足");
+            }
+            if (r == -1) {
+                // 库存 key 不存在：秒杀券不存在或 Redis 库存未初始化（见 VoucherServiceImpl#addSeckillVoucher）
+                return Result.fail("秒杀已结束或不存在");
+            }
+            return Result.fail("不能重复下单");
         }
         // 2. 脱离请求线程，发消息给 RocketMQ
         VoucherOrder order = new VoucherOrder();
@@ -199,11 +113,12 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
         // 增加消息发送的异常处理
         //放入mq
         String jsonStr = JSONUtil.toJsonStr(order);
-        // 1.落库消息（延迟级别 3 ≈ 10s，模拟原 RabbitMQ QA 队列的 10s TTL 延时语义）
+        // 1.落库消息（delayLevel=0，立即投递）：异步只是把 DB 写从请求线程剥离以削峰，
+        //   不能延迟落库——否则用户秒付时 DB 尚无订单，payCallback 会查不到订单（原 RabbitMQ 版 10s 延时是历史遗留）
         try {
             rocketMQTemplate.syncSend(ORDER_TOPIC,
                     org.springframework.messaging.support.MessageBuilder.withPayload(jsonStr).build(),
-                    3000, 3);
+                    3000, 0);
         } catch (Exception e) {
             log.error("发送 RocketMQ 落库消息失败，订单ID: {}", orderId, e);
             throw new RuntimeException("发送消息失败");
@@ -221,51 +136,6 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
         return Result.ok(orderId);
     }
 
-
-//    public Result seckillVoucher(Long voucherId) {
-//        //查询用户券信息
-//        SeckillVoucher voucher = seckillVoucherService.getById(voucherId);
-//        //判断秒杀时间
-//        //是否开始
-//        LocalDateTime beginTime = voucher.getBeginTime();
-//        if(beginTime.isAfter(LocalDateTime.now())){
-//            return Result.fail("秒杀尚未开始！");
-//        }
-//        //是否结束
-//        LocalDateTime endTime = voucher.getEndTime();
-//        if(endTime.isBefore(LocalDateTime.now())){
-//            return Result.fail("秒杀已经结束");
-//        }
-//        //判断库存呢是否充足
-//        if(voucher.getStock()<=0){
-//            return Result.fail("库存不足！");
-//        }
-//        Long userId = UserHolder.getUser().getId();
-//       //创建锁对象
-//        //SimpleRedisLock  lock = new SimpleRedisLock("order:" + userId, stringRedisTemplate);
-//        RLock lock = redissonClient.getLock("lock:order:" + userId);
-//        //获取锁
-//        boolean isLock = lock.tryLock();
-//        //判断是否获取锁成功
-//        if(!isLock) {
-//            //失败，返回错误或重试
-//            return Result.fail("不允许重复下单");
-//
-//        }
-//        try {
-//            //直接调用，不会触发spring aop的事务管理
-//            //要通过代理调用，获取代理对象，才会被spring aop拦截
-//            IVoucherOrderService proxy = (IVoucherOrderService) AopContext.currentProxy();
-//            return proxy.createVoucherOrder(voucherId);
-//        } catch (IllegalStateException e) {
-//            throw new RuntimeException(e);
-//        }finally {
-//            //释放锁
-//            lock.unlock();
-//        }
-//
-//
-//    }
 
     /**
      * 支付回调：乐观锁更新订单状态
@@ -368,33 +238,5 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
                 .remove(RedisConstants.SECKILL_ORDER_KEY + order.getVoucherId(), order.getUserId().toString());
         log.info("订单超时关单成功并释放库存，orderId: {}, voucherId: {}", order.getId(), order.getVoucherId());
         return true;
-    }
-
-    @Transactional
-    public void createVoucherOrder(VoucherOrder voucherOrder) {
-        //一人一单
-        //查询订单
-        Long userId =voucherOrder.getUserId();
-            Long count = query().eq("user_id", userId).eq("voucher_id", voucherOrder.getVoucherId()).count();
-            //判断是否存在
-            if (count > 0) {
-                //用户已经购买过了
-                log.error("用户已经购买过一次了");
-                return;
-            }
-            //扣减库存
-            boolean success = seckillVoucherService
-                    .update()
-                    .setSql("stock=stock-1")
-                    .eq("voucher_id", voucherOrder.getVoucherId())
-                    .gt("stock", 0)
-                    .update();
-            if (!success) {
-                log.error("库存不足");
-                return ;
-            }
-
-            save(voucherOrder);
-
     }
 }

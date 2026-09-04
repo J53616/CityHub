@@ -73,7 +73,7 @@ CityHub 是一个类"大众点评"的本地生活服务平台，提供商家信�
 | 亮点 | 方案 | 代码位置 |
 |---|---|---|
 | 不超卖 + 一人一单 | Redis + Lua 原子脚本 | `seckill.lua` |
-| 下单异步削峰 | RocketMQ 延迟消息解耦落库 | `VoucherOrderServiceImpl`、`SeckillVoucherListener` |
+| 下单异步削峰 | RocketMQ 异步消息解耦落库（立即投递） | `VoucherOrderServiceImpl`、`SeckillVoucherListener` |
 | 缓存击穿 | 逻辑过期 + 互斥锁 + 线程池异步重建 | `CacheClient#queryWithLogicalExpire` |
 | 缓存穿透 | 缓存空值 + 短 TTL | `CacheClient#queryWithPassThrough` |
 | 接口限流 | 滑动窗口（注解 + AOP + Lua），支持全局 / IP / 用户维度 | `RateLimitAspect`、`rateLimit.lua` |
@@ -154,13 +154,13 @@ redis.call('sadd', orderKey, userId)                     -- 记录用户
 
 - **库存**：`seckill:stock:{voucherId}`（String）；**已购用户**：`seckill:order:{voucherId}`（Set）。
 - Lua 在 Redis 中原子执行"库存判断 + 一人一单 + 扣减 + 记录"，**无需分布式锁**。
-- 校验通过后发 RocketMQ（延迟级别 3 ≈ 10s），立即返回订单号给前端，消费者异步落库。
+- 校验通过后发 RocketMQ 落库消息（**立即投递**，仅解耦削峰），立即返回订单号给前端，消费者异步落库。
 
 ### 2. 消息可靠性：幂等、丢失、最终一致
 
 - **幂等**：订单 ID 为主键，重复消费写入失败天然跳过。
 - **丢失兜底**：核心约束（不超卖 + 一人一单）由 Redis + Lua 保证，不受 MQ 丢失影响；DB 副本漂移由 **对账任务** 定期修正（见 §6）。
-- **消费延迟兜底**：延迟级别 3（≈10s）模拟"下单后延迟落库"，用户支付回调时若 DB 尚无订单，可利用回调信息反向生成"已支付"订单。
+- **落库不延迟（关键取舍）**：落库消息 `delayLevel=0` 立即投递，订单尽快落库可见——否则用户秒付时 DB 尚无订单，支付回调会查不到订单。真正需要"延迟"的只有超时关单（见 §5，`delayLevel=14`）。原 RabbitMQ 版的 10s 延时落库为历史遗留，RocketMQ 版已去掉。
 
 ### 3. 缓存：穿透 / 击穿 / 雪崩
 
@@ -246,7 +246,7 @@ public Result seckillVoucher(@PathVariable("id") Long voucherId) { ... }
 | 设计 | 状态 |
 |---|---|
 | Redis + Lua 秒杀（不超卖 / 一人一单） | ✅ 已实现（`seckill.lua` + `VoucherOrderServiceImpl`） |
-| RocketMQ 异步下单（延迟消息） | ✅ 已实现（`RocketMQTemplate` + `SeckillVoucherListener`） |
+| RocketMQ 异步下单（异步落库削峰） | ✅ 已实现（`RocketMQTemplate` + `SeckillVoucherListener`） |
 | 全局唯一 ID | ✅ 已实现（`RedisIdWorker`） |
 | 逻辑过期缓存（防击穿） | ✅ 已实现（`CacheClient#queryWithLogicalExpire`） |
 | 缓存空值（防穿透） | ✅ 已实现（`CacheClient#queryWithPassThrough`） |
