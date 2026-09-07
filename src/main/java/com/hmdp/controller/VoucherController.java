@@ -54,4 +54,14 @@ public class VoucherController {
     public Result queryVoucherOfShop(@PathVariable("shopId") Long shopId) {
        return voucherService.queryVoucherOfShop(shopId);
     }
+
+    /**
+     * 查询秒杀券实时剩余库存（高频轮询走 Caffeine 本地缓存 + Redis，不触 DB）
+     * @param id 秒杀券id
+     * @return 剩余库存：≥0 为剩余量；-1 表示券不存在/秒杀未预热
+     */
+    @GetMapping("/seckill/stock/{id}")
+    public Result querySeckillStock(@PathVariable("id") Long id) {
+        return Result.ok(voucherService.querySeckillStock(id));
+    }
 }

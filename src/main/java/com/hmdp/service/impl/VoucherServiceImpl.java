@@ -8,6 +8,7 @@ import com.hmdp.entity.SeckillVoucher;
 import com.hmdp.service.ISeckillVoucherService;
 import com.hmdp.service.IVoucherService;
 import com.hmdp.utils.RedisConstants;
+import com.hmdp.utils.SeckillStockCache;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -32,6 +33,8 @@ public class VoucherServiceImpl extends ServiceImpl<VoucherMapper, Voucher> impl
     private ISeckillVoucherService seckillVoucherService;
     @Resource
     private StringRedisTemplate stringRedisTemplate;
+    @Resource
+    private SeckillStockCache seckillStockCache;
 
     @Override
     public Result queryVoucherOfShop(Long shopId) {
@@ -55,6 +58,15 @@ public class VoucherServiceImpl extends ServiceImpl<VoucherMapper, Voucher> impl
         seckillVoucherService.save(seckillVoucher);
         //保存秒杀得库存到redis
         stringRedisTemplate.opsForValue().set(SECKILL_STOCK_KEY +voucher.getId(),voucher.getStock().toString());
+        // 预热后主动失效本地缓存，避免旧值残留
+        seckillStockCache.invalidate(voucher.getId());
+    }
 
+    @Override
+    public Integer querySeckillStock(Long voucherId) {
+        // 走 Caffeine 本地一级 + Redis 二级缓存，拦截秒杀页高频轮询读，不触 DB
+        Integer stock = seckillStockCache.getRemainStock(voucherId);
+        // Redis 无此券库存（未预热/秒杀不存在）返回 -1，便于前端区分"售罄(0)"与"不存在(-1)"
+        return stock == null ? -1 : stock;
     }
 }

@@ -77,6 +77,12 @@
             <version>2.3.3</version>
         </dependency>
 
+        <!-- Caffeine 本地二级缓存（秒杀余量展示读路径，1s TTL 拦截热点重复读，见 SeckillStockCache） -->
+        <dependency>
+            <groupId>com.github.ben-manes.caffeine</groupId>
+            <artifactId>caffeine</artifactId>
+        </dependency>
+
     </dependencies>
     <build>
         <plugins>

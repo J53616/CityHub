@@ -8,8 +8,8 @@ import com.hmdp.mapper.VoucherOrderMapper;
 import com.hmdp.service.ISeckillVoucherService;
 import com.hmdp.service.IVoucherOrderService;
 import com.baomidou.mybatisplus.extension.service.impl.ServiceImpl;
-import com.hmdp.utils.RedisConstants;
 import com.hmdp.utils.RedisIdWorker;
+import com.hmdp.utils.SeckillStockCache;
 import com.hmdp.utils.UserHolder;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.rocketmq.spring.core.RocketMQTemplate;
@@ -46,14 +46,23 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
     @Resource
     private StringRedisTemplate stringRedisTemplate;
 
+    @Resource
+    private SeckillStockCache seckillStockCache;
+
     /**
      * 脚本初始化
      */
     private static final DefaultRedisScript<Long> SECKILL_SCRIPT;
+    /** 关单库存回滚脚本（Lua 原子执行：回补库存 + 移除下单记录，见 restore.lua） */
+    private static final DefaultRedisScript<Long> RESTORE_SCRIPT;
     static {
         SECKILL_SCRIPT=new DefaultRedisScript<>();
         SECKILL_SCRIPT.setLocation(new ClassPathResource("seckill.lua"));
         SECKILL_SCRIPT.setResultType(Long.class);
+
+        RESTORE_SCRIPT = new DefaultRedisScript<>();
+        RESTORE_SCRIPT.setLocation(new ClassPathResource("restore.lua"));
+        RESTORE_SCRIPT.setResultType(Long.class);
     }
 
     /** 订单状态（与 tb_voucher_order.status 对应） */
@@ -65,8 +74,12 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
     private static final String ORDER_TOPIC = "seckill-order-topic:seckill";
     /** 超时关单 topic（延迟消息驱动，消费者 OrderTimeoutListener） */
     private static final String CLOSE_ORDER_TOPIC = "seckill-order-close-topic:close";
-    /** 超时关单延迟级别：14 = 10 分钟（RocketMQ 固定延迟级别表），与超时阈值一致 */
-    private static final int CLOSE_DELAY_LEVEL = 14;
+    /**
+     * 超时关单延迟级别：5 = 1 分钟（RocketMQ 默认延迟级别表 1s/5s/10s/30s/1m/2m/...，
+     * 1 分钟对应 level 5），与 OrderTimeoutTask 的超时阈值 1 分钟一致。
+     * 说明：RocketMQ 无“2 分钟”以外的细粒度精确档位，秒杀场景选 1 分钟档，将“超时未支付”窗口压缩到最短可配置档。
+     */
+    private static final int CLOSE_DELAY_LEVEL = 5;
 
     /**
      * 秒杀链路演进（历史实现已删除，完整旧代码见 git 历史）：
@@ -104,7 +117,9 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
             }
             return Result.fail("不能重复下单");
         }
-        // 2. 脱离请求线程，发消息给 RocketMQ
+        // 2.0 预扣成功，主动失效本地二级缓存，让秒杀页剩余库存立即可见（无需等 1s TTL）
+        seckillStockCache.invalidate(voucherId);
+        // 2.1 脱离请求线程，发消息给 RocketMQ
         VoucherOrder order = new VoucherOrder();
         order.setId(orderId);
         order.setUserId(userId);
@@ -123,7 +138,7 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
             log.error("发送 RocketMQ 落库消息失败，订单ID: {}", orderId, e);
             throw new RuntimeException("发送消息失败");
         }
-        // 2.超时关单延迟消息：到期（≈10 分钟）由 OrderTimeoutListener 检查关单；
+        // 2.超时关单延迟消息：到期（1 分钟，delayLevel=5）由 OrderTimeoutListener 检查关单；
         //   发送失败不阻塞下单，由 OrderTimeoutTask 定时扫描兜底关闭
         try {
             rocketMQTemplate.syncSend(CLOSE_ORDER_TOPIC,
@@ -212,7 +227,7 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
      *   <li>CAS 关单：{@code update tb_voucher_order set status=4 where id=? and status=1}，
      *       与支付回调（status=1→2）互斥，已支付 / 已关闭订单影响 0 行；</li>
      *   <li>DB 秒杀库存回补；</li>
-     *   <li>Redis 回补：库存 +1、移除用户下单记录（恢复一人一单资格）。</li>
+     *   <li>Redis 回补：Lua 原子执行【库存 +1、移除用户下单记录（恢复一人一单资格）】，见 restore.lua。</li>
      * </ol>
      */
     private boolean doCloseTimeoutOrder(VoucherOrder order) {
@@ -231,12 +246,18 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
                 .setSql("stock = stock + 1")
                 .eq("voucher_id", order.getVoucherId())
                 .update();
-        // 释放 Redis 预扣：补库存 + 移除下单用户记录（恢复一人一单资格）
-        stringRedisTemplate.opsForValue()
-                .increment(RedisConstants.SECKILL_STOCK_KEY + order.getVoucherId());
-        stringRedisTemplate.opsForSet()
-                .remove(RedisConstants.SECKILL_ORDER_KEY + order.getVoucherId(), order.getUserId().toString());
-        log.info("订单超时关单成功并释放库存，orderId: {}, voucherId: {}", order.getId(), order.getVoucherId());
+        // 释放 Redis 预扣：Lua 原子执行【回补库存 + 移除下单用户记录（恢复一人一单资格）】。
+        // 相比原先 increment + sremove 两条非原子命令，Lua 保证两步要么都成功要么都不成功，
+        // 避免“回补一半崩溃”导致 Redis 库存与下单记录漂移。restore.lua 返回 -1 表示用户记录已不在
+        // （幂等命中，此前已释放），此时同样视为回补生效，不再重复加库存。
+        Long restored = stringRedisTemplate.execute(
+                RESTORE_SCRIPT,
+                Collections.emptyList(),
+                order.getUserId().toString(), order.getVoucherId().toString());
+        // 回补后主动失效本地二级缓存，让释放的库存立即可抢（无需等 1s TTL）
+        seckillStockCache.invalidate(order.getVoucherId());
+        log.info("订单超时关单成功并释放库存，orderId: {}, voucherId: {}, Redis 回补后库存: {}",
+                order.getId(), order.getVoucherId(), restored);
         return true;
     }
 }
