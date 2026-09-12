@@ -5,11 +5,14 @@ import com.hmdp.service.IVoucherOrderService;
 import com.hmdp.utils.RedisConstants;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.data.redis.core.Cursor;
+import org.springframework.data.redis.core.ScanOptions;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
 
 import java.time.LocalDateTime;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
 
@@ -89,8 +92,19 @@ public class OrderTimeoutTask {
      */
     private boolean hasPendingOrders() {
         try {
-            Set<String> keys = stringRedisTemplate.keys(RedisConstants.SECKILL_ORDER_KEY + "*");
-            if (keys == null || keys.isEmpty()) {
+            // 用 SCAN 游标增量遍历替代 KEYS：KEYS 会全库阻塞扫描，在单线程 Redis 上是大忌（生产禁用命令）。
+            // SCAN 可能返回重复 key，用 Set 去重；秒杀券 key 数量级很小，一次收集开销可忽略。
+            Set<String> keys = new HashSet<>();
+            try (Cursor<String> cursor = stringRedisTemplate.scan(
+                    ScanOptions.scanOptions()
+                            .match(RedisConstants.SECKILL_ORDER_KEY + "*")
+                            .count(200)
+                            .build())) {
+                while (cursor.hasNext()) {
+                    keys.add(cursor.next());
+                }
+            }
+            if (keys.isEmpty()) {
                 return false;
             }
             for (String key : keys) {

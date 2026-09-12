@@ -8,6 +8,7 @@ import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.rocketmq.spring.annotation.RocketMQMessageListener;
 import org.apache.rocketmq.spring.core.RocketMQListener;
+import org.springframework.dao.DuplicateKeyException;
 import org.springframework.stereotype.Component;
 
 /**
@@ -34,8 +35,15 @@ public class SeckillVoucherListener implements RocketMQListener<String> {
     public void onMessage(String msg) {
         log.info("收到秒杀订单消息: {}", msg);
         VoucherOrder voucherOrder = JSONUtil.toBean(msg, VoucherOrder.class);
-        // 订单 ID 为主键唯一，重复消费时 save 会因主键冲突失败，天然幂等
-        voucherOrderService.save(voucherOrder);
+        // 订单 ID 为主键，重复消费会命中主键唯一约束冲突。
+        // 这是"幂等命中"的**正常语义，不是消费失败**：必须捕获并直接返回，否则 RocketMQ 会判定消费失败
+        // 并反复重投（默认 maxReconsumeTimes=16 次后进死信队列）。同时必须 return，避免重复扣减 DB 库存。
+        try {
+            voucherOrderService.save(voucherOrder);
+        } catch (DuplicateKeyException e) {
+            log.info("订单已存在，幂等命中，跳过落库与扣减，orderId: {}", voucherOrder.getId());
+            return;
+        }
         // 数据库秒杀库存减一（CAS，stock > 0）
         seckillVoucherService.update()
                 .setSql("stock = stock - 1")

@@ -20,6 +20,7 @@ import org.springframework.web.context.request.ServletRequestAttributes;
 import jakarta.annotation.Resource;
 import jakarta.servlet.http.HttpServletRequest;
 import java.util.Collections;
+import java.util.UUID;
 
 /**
  * 滑动窗口限流切面
@@ -62,7 +63,10 @@ public class RateLimitAspect {
                 Collections.singletonList(key),
                 String.valueOf(rateLimit.time()),
                 String.valueOf(rateLimit.count()),
-                String.valueOf(System.currentTimeMillis())
+                String.valueOf(System.currentTimeMillis()),
+                // member 必须唯一：同一毫秒内的并发请求若共用时间戳作 member 会被 ZADD 覆盖，
+                // 使 ZCARD 偏小、放行数超过阈值（突发流量下限流失效）
+                UUID.randomUUID().toString()
         );
         // 3.被限流
         if (result == null || result == 0L) {
