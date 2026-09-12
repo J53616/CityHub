@@ -135,8 +135,12 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
                     org.springframework.messaging.support.MessageBuilder.withPayload(jsonStr).build(),
                     3000, 0);
         } catch (Exception e) {
-            log.error("发送 RocketMQ 落库消息失败，订单ID: {}", orderId, e);
-            throw new RuntimeException("发送消息失败");
+            // 落库消息发送失败 ⇒ 订单永远不会落库，必须同步回滚 Redis 预扣。
+            // 否则该名额被永久占用：DB 无订单 → OrderTimeoutTask / 延迟关单消息都扫不到、无法释放；
+            // 且 StockReconcileTask 以 Redis 为准会把 DB 库存一并改低，名额彻底丢失（少卖）。
+            log.error("发送 RocketMQ 落库消息失败，回滚 Redis 预扣，订单ID: {}", orderId, e);
+            rollbackPreDeduct(userId, voucherId);
+            throw new RuntimeException("下单失败，请重试");
         }
         // 2.超时关单延迟消息：到期（1 分钟，delayLevel=5）由 OrderTimeoutListener 检查关单；
         //   发送失败不阻塞下单，由 OrderTimeoutTask 定时扫描兜底关闭
@@ -219,6 +223,26 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
     @Transactional
     public boolean closeTimeoutOrder(VoucherOrder order) {
         return doCloseTimeoutOrder(order);
+    }
+
+    /**
+     * 回滚 Redis 预扣（库存 +1、移除一人一单标记），用于发落库消息失败时释放已占用的名额。
+     * <p>
+     * 复用 {@code restore.lua} 的幂等分支：用户不在下单集合中时直接返回 -1，不会重复回补库存，
+     * 因此即便回滚与关单释放发生重叠也不会多加库存。回补后主动失效本地二级缓存，让名额立即可抢。
+     * </p>
+     */
+    private void rollbackPreDeduct(Long userId, Long voucherId) {
+        try {
+            stringRedisTemplate.execute(
+                    RESTORE_SCRIPT,
+                    Collections.emptyList(),
+                    userId.toString(), voucherId.toString());
+            seckillStockCache.invalidate(voucherId);
+        } catch (Exception ex) {
+            // 回滚本身也失败（如 Redis 抖动）：预扣将滞留，只能依赖告警与对账人工介入
+            log.error("Redis 预扣回滚失败，userId: {}, voucherId: {}，需人工核查", userId, voucherId, ex);
+        }
     }
 
     /**
