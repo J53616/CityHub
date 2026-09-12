@@ -35,8 +35,12 @@ public class SeckillStockCache {
     /** 本地缓存极短 TTL（秒）：拦截重复读的同时保证最多滞后 1s */
     private static final int LOCAL_TTL_SECONDS = 1;
 
-    /** 读 Redis 时缓存 miss 也短暂空缓存，避免极端热点下穿透 */
-    private static final Integer NULL_MARK = null;
+    /**
+     * 空值哨兵：Caffeine 不允许存 null，故用 -1 表示"Redis 无此券库存"。
+     * 哨兵与真实库存一起缓存 1s（见 {@link #LOCAL_TTL_SECONDS}），避免不存在的券在热点轮询下
+     * 每次读都穿透到 Redis（真实库存恒 ≥ 0，不会与哨兵冲突）。
+     */
+    private static final int NOT_EXIST_MARK = -1;
 
     public SeckillStockCache(StringRedisTemplate stringRedisTemplate) {
         this.stringRedisTemplate = stringRedisTemplate;
@@ -61,14 +65,16 @@ public class SeckillStockCache {
         // 1.一级缓存（Caffeine）命中直接返回
         Integer cached = stockCache.getIfPresent(voucherId);
         if (cached != null) {
-            return cached;
+            // 命中哨兵说明 Redis 无此券库存，对外仍返回 null
+            return cached == NOT_EXIST_MARK ? null : cached;
         }
         // 2.miss：读 Redis 权威库存并回填
         String stockStr = stringRedisTemplate.opsForValue()
                 .get(RedisConstants.SECKILL_STOCK_KEY + voucherId);
         if (stockStr == null) {
-            // 秒杀券不存在或库存未初始化（见 VoucherServiceImpl#addSeckillVoucher）
-            return NULL_MARK;
+            // 秒杀券不存在或库存未初始化（见 VoucherServiceImpl#addSeckillVoucher），写入哨兵做短暂空缓存
+            stockCache.put(voucherId, NOT_EXIST_MARK);
+            return null;
         }
         Integer stock = Integer.valueOf(stockStr);
         stockCache.put(voucherId, stock);
