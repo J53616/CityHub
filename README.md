@@ -51,11 +51,11 @@ CityHub 是一个类"大众点评"的本地生活服务平台，提供商家信�
 |---|---|---|
 | Spring Boot | 3.2.5 | 应用框架（JDK 17+） |
 | MySQL | 8.x | 业务数据存储 |
-| Redis | 6+ / 7 | 缓存、秒杀库存、限流、分布式锁、GEO、BitMap、HyperLogLog |
+| Redis | 6+ / 7 | 缓存、秒杀库存、限流、GEO（附近店铺）、BitMap（签到） |
 | Lua | - | 秒杀库存扣减、滑动窗口限流的原子脚本 |
 | MyBatis-Plus | 3.5.5 | ORM，简化 CRUD 与分页 |
 | RocketMQ | 4.x / 5.x（starter 2.3.3） | 秒杀下单异步解耦、延迟消息 |
-| Redisson | 3.13.6 | 分布式锁（可重入 + 看门狗自动续期） |
+| Redisson | 3.13.6 | 分布式锁客户端（已配置，作为后续需串行化场景的接入点；当前无调用点） |
 
 ---
 
@@ -64,9 +64,9 @@ CityHub 是一个类"大众点评"的本地生活服务平台，提供商家信�
 ### 业务功能
 
 - 商家信息查询 / 新增 / 更新，按类型、按名称、按地理位置（GEO 5km 内）查询
-- 优惠券秒杀（核心），支持秒杀时间校验、一人一单、不超卖
-- 推广博客：发布 / 点赞（ZSet 排行榜）/ 关注 / 好友 Feed 流（推模式）
-- 用户体系：短信验证码登录、Token 刷新、签到（BitMap）、UV 统计（HyperLogLog）
+- 优惠券秒杀（核心），支持一人一单、不超卖。⚠️ **秒杀开始/结束时间暂未在下单链路校验**（`tb_seckill_voucher` 已存 `begin_time` / `end_time` 字段但未参与判断），活动时间需由运营控制上架时机
+- 推广博客：发布 / 点赞（ZSet 按时间排序，支持查询最近点赞的 5 位用户）/ 关注 / 好友 Feed 流（推模式）
+- 用户体系：短信验证码登录、Token 自动续期（每次请求刷新 30 分钟 TTL）、签到（BitMap）
 
 ### 高并发优化亮点
 
@@ -82,7 +82,7 @@ CityHub 是一个类"大众点评"的本地生活服务平台，提供商家信�
 | 缓存删除补偿 | 删缓存失败发 RocketMQ 重试 + 物理 TTL 兜底 | `ShopServiceImpl#update`、`CacheDeleteListener` |
 | 支付回调 | 乐观锁状态流转，与超时关单并发互斥 | `VoucherOrderServiceImpl#payCallback` |
 | 全局唯一 ID | 时间戳 + 自增序列号（64 位） | `RedisIdWorker` |
-| 分布式锁 | 自研 SETNX 锁 → Redisson（可重入 + 看门狗） | `SimpleRedisLock`、`RedissonConfig` |
+| 分布式锁 | 曾用自研 SETNX 锁 → Redisson；**秒杀链路已改为 Lua 原子方案，不再需要锁** | `RedissonConfig`（接入点保留，当前无调用点） |
 
 ---
 
@@ -223,8 +223,8 @@ public Result seckillVoucher(@PathVariable("id") Long voucherId) { ... }
 
 ### 9. 全局唯一 ID 与分布式锁
 
-- **RedisIdWorker**：41 位时间戳 + 按天自增序列号组成的 64 位 ID（类雪花），替代数据库自增，避免分布式重复。
-- **分布式锁**：自研 `SimpleRedisLock`（SETNX + Lua 释放）→ 演进为 Redisson（可重入 + 看门狗自动续期）。秒杀下单链路因 Lua 原子性不再需要分布式锁，锁仍用于其他需串行的场景。
+- **RedisIdWorker**：`1 位符号位 + 31 位时间戳（秒）+ 32 位按天自增序列号`组成的 64 位 ID（类雪花结构），替代数据库自增。**注意：与标准雪花不同，它没有机器位**，全局唯一性由"所有节点共用同一个 Redis 计数器"（`icr:{keyPrefix}:{yyyy:MM:dd}`）保证，而非机器位隔离。
+- **分布式锁**：演进路径为「自研 `SimpleRedisLock`（SETNX + Lua 释放）→ Redisson」，但**秒杀下单链路最终靠 Lua 原子性替代了分布式锁，性能与正确性都更优**（见第 3 节）。自研锁类已随该次重构删除（可从 git 历史查看），`RedissonConfig` 保留作为后续需要真正串行化场景的接入点，**当前无业务调用点**。
 
 ---
 
@@ -255,9 +255,13 @@ public Result seckillVoucher(@PathVariable("id") Long voucherId) { ... }
 | 秒杀数据对账（Redis 权威修正） | ✅ 已实现（`StockReconcileTask`） |
 | 缓存删除失败 MQ 补偿 + 物理 TTL 兜底 | ✅ 已实现（`ShopServiceImpl#update` + `CacheDeleteListener`） |
 | 支付回调乐观锁（状态流转 / 退款） | ✅ 已实现（`VoucherOrderServiceImpl#payCallback`） |
-| 分布式锁（SETNX → Redisson） | ✅ 已实现（`SimpleRedisLock` + Redisson） |
-| 登录 / 点赞 / 关注 / 附近 / 签到 / UV | ✅ 已实现 |
-| Caffeine 本地二级缓存 | ⬜ 设计思考，代码未实现（见「后续计划」） |
+| 分布式锁（SETNX → Redisson） | 📦 已演进为 Lua 原子方案（锁类已删，`RedissonConfig` 保留待用；当前无调用点） |
+| 登录 / 点赞 / 关注 / 附近（GEO）/ 签到（BitMap） | ✅ 已实现 |
+| 秒杀活动时间校验（`begin_time` / `end_time`） | ⬜ 字段已存但未参与下单判断（见「后续计划」） |
+| UV 统计（HyperLogLog） | ⬜ 代码未实现 |
+| Caffeine 本地二级缓存（秒杀库存读路径） | ✅ 已实现（`SeckillStockCache` + `GET /voucher/seckill/stock/{id}`） |
+| RocketMQ 延迟消息关单（1 分钟）+ 定时扫描兜底 | ✅ 已实现（`OrderTimeoutListener` + `OrderTimeoutTask`） |
+| Redis 预扣回滚（发消息失败 / 关单释放） | ✅ 已实现（`restore.lua`，幂等回补） |
 
 ---
 
@@ -265,9 +269,10 @@ public Result seckillVoucher(@PathVariable("id") Long voucherId) { ... }
 
 以下方案针对 **更大规模部署场景**（多实例、更高并发、更强风控），当前单体架构下暂未落地，README 记录设计取舍，可随时按需实现：
 
-- **Caffeine 本地二级缓存**：Redis 前加本地缓存，进一步降低热点 key 的 Redis 压力。
-- **RocketMQ 事务消息 + 本地消息表**：将"下单"与"发消息"强一致，替代当前对账兜底。
+- **RocketMQ 事务消息 + 本地消息表**：将"下单"与"发消息"强一致，替代当前"发消息失败即回滚 Redis 预扣 + 对账兜底"的补偿方案。
 - **支付渠道对接**：支付回调目前为模拟接口，未接真实支付宝 / 微信的验签、退款等能力。
+- **秒杀活动时间校验**：`tb_seckill_voucher` 已有 `begin_time` / `end_time`，但下单链路的 `seckill.lua` 只判断库存与一人一单，未校验活动是否开始 / 结束。生产需在 Lua 中增加时间判断，或由定时任务在开始时报时预热、结束时清理 Key。
+- **Redis 持久化策略**：项目仅提供 `spring.data.redis` 连接配置，未声明 RDB / AOF 策略。Redis 整体宕机且无持久化时 `seckill:stock` 会丢失，恢复后 Lua 因取不到库存 Key 返回 `-1`（表现为"秒杀已结束"）。生产需显式开启 AOF（`appendonly yes`）并配置主从。
 
 ---
 
